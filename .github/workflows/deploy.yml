@@ -1,0 +1,288 @@
+name: Deploy .NET Application
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'README.md'
+      - 'SETUP-DOTNET-PROJECTS.md'
+      - 'docs/**'
+      - '*.md'
+  workflow_dispatch:
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: asia-south1
+  SERVICE_NAME: zenwebapi18
+  IMAGE_NAME: zenwebapi18
+  REPO_NAME: zenwebapi18-repo
+  DEPLOYMENT_TYPE: gke
+  GKE_CLUSTER: zenhotel-cluster
+  GKE_NAMESPACE: default
+
+jobs:
+  check-dotnet:
+    name: Check for .NET Projects
+    runs-on: ubuntu-latest
+    outputs:
+      has-dotnet: ${{ steps.check.outputs.has-dotnet }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Check for .NET project files
+      id: check
+      run: |
+        if find . -name "*.csproj" -o -name "*.sln" | grep -q .; then
+          echo "has-dotnet=true" >> $GITHUB_OUTPUT
+          echo "✅ Found .NET project files"
+        else
+          echo "has-dotnet=false" >> $GITHUB_OUTPUT
+          echo "⚠️ No .NET project files found. Add your .NET solution and projects to enable deployment."
+        fi
+
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    needs: check-dotnet
+    if: needs.check-dotnet.outputs.has-dotnet == 'true'
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Configure Docker to use gcloud as a credential helper
+      run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev
+
+    - name: Setup Artifact Registry repository
+      run: |
+        # Set project explicitly
+        gcloud config set project ${{ env.GCP_PROJECT_ID }}
+        
+        # Debug: Show current project and region
+        echo "Current project: $(gcloud config get-value project)"
+        echo "Target region: ${{ env.GCP_REGION }}"
+        
+        # Enable Artifact Registry API first (this usually works with basic permissions)
+        echo "🔧 Enabling Artifact Registry API..."
+        gcloud services enable artifactregistry.googleapis.com --project=${{ env.GCP_PROJECT_ID }} --quiet || {
+          echo "⚠️ Could not enable API automatically. It may already be enabled or require manual enablement."
+        }
+        
+        # Wait for API to be ready
+        echo "⏳ Waiting for API to be ready..."
+        sleep 15
+        
+        # Try to check if repository exists
+        echo "🔍 Checking if ${{ env.REPO_NAME }} repository exists..."
+        if gcloud artifacts repositories describe ${{ env.REPO_NAME }} --location=${{ env.GCP_REGION }} --project=${{ env.GCP_PROJECT_ID }} --quiet >/dev/null 2>&1; then
+          echo "✅ Artifact Registry repository '${{ env.REPO_NAME }}' already exists"
+        else
+          echo "📦 Repository does not exist. Creating it..."
+          
+          # Attempt to create the repository
+          if gcloud artifacts repositories create ${{ env.REPO_NAME }} \
+            --repository-format=docker \
+            --location=${{ env.GCP_REGION }} \
+            --description="Docker repository for ${{ env.SERVICE_NAME }}" \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --quiet; then
+            echo "✅ Successfully created Artifact Registry repository '${{ env.REPO_NAME }}'"
+          else
+            echo "❌ Failed to create repository automatically"
+            echo ""
+            echo "�️ This usually happens due to insufficient permissions or disabled APIs."
+            echo "Please run the following commands manually:"
+            echo ""
+            echo "1. Enable APIs:"
+            echo "   gcloud services enable artifactregistry.googleapis.com --project=${{ env.GCP_PROJECT_ID }}"
+            echo "   gcloud services enable cloudresourcemanager.googleapis.com --project=${{ env.GCP_PROJECT_ID }}"
+            echo ""
+            echo "2. Create repository:"
+            echo "   gcloud artifacts repositories create docker-repo \\"
+            echo "     --repository-format=docker \\"
+            echo "     --location=${{ env.GCP_REGION }} \\"
+            echo "     --description='Docker repository for ${{ env.SERVICE_NAME }}' \\"
+            echo "     --project=${{ env.GCP_PROJECT_ID }}"
+            echo ""
+            echo "3. Grant additional IAM roles to the service account:"
+            echo "   gcloud projects add-iam-policy-binding ${{ env.GCP_PROJECT_ID }} \\"
+            echo "     --member='serviceAccount:backstage-deployer@${{ env.GCP_PROJECT_ID }}.iam.gserviceaccount.com' \\"
+            echo "     --role='roles/serviceusage.serviceUsageAdmin'"
+            echo ""
+            echo "🔄 Continuing with build process. Docker push may fail if repository doesn't exist."
+          fi
+        fi
+        
+        # Verify repository exists before proceeding
+        echo "🔍 Final verification - checking repository status..."
+        if gcloud artifacts repositories describe ${{ env.REPO_NAME }} --location=${{ env.GCP_REGION }} --project=${{ env.GCP_PROJECT_ID }} --quiet >/dev/null 2>&1; then
+          echo "✅ Repository verified and ready for use"
+          echo "REPO_READY=true" >> $GITHUB_ENV
+        else
+          echo "⚠️ Repository verification failed"
+          echo "REPO_READY=false" >> $GITHUB_ENV
+        fi
+
+    - name: Build and Push Docker image
+      run: |
+        # Set IMAGE_URL early and export to environment
+        IMAGE_URL="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+        echo "IMAGE_URL=$IMAGE_URL" >> $GITHUB_ENV
+        
+        echo "🐳 Building Docker image..."
+        echo "📍 Image URL: $IMAGE_URL"
+        
+        # Build the image
+        echo "🔨 Building image..."
+        docker build -t $IMAGE_URL .
+        
+        # Verify the image was built
+        echo "✅ Image built successfully:"
+        docker images | grep ${{ env.IMAGE_NAME }} || echo "Image not found in local list"
+        
+        # Check if repository is ready before pushing
+        if [ "${{ env.REPO_READY }}" = "true" ]; then
+          echo "📤 Repository is ready. Pushing Docker image..."
+        else
+          echo "⚠️ Repository status unknown. Attempting to push anyway..."
+        fi
+        
+        # Push the image with enhanced retry logic
+        PUSH_SUCCESS=false
+        MAX_RETRIES=5
+        
+        for i in $(seq 1 $MAX_RETRIES); do
+          echo "📤 Push attempt $i of $MAX_RETRIES..."
+          
+          if docker push $IMAGE_URL; then
+            echo "✅ Successfully pushed image on attempt $i"
+            PUSH_SUCCESS=true
+            break
+          else
+            echo "❌ Push failed on attempt $i"
+            
+            # On first failure, try to diagnose the issue
+            if [ $i -eq 1 ]; then
+              echo ""
+              echo "🔍 Diagnosing push failure..."
+              
+              # Check if we can reach the registry
+              echo "🌐 Testing registry connectivity..."
+              if docker pull hello-world >/dev/null 2>&1; then
+                echo "✅ Docker daemon is working"
+              else
+                echo "❌ Docker daemon issues detected"
+              fi
+              
+              # Check repository existence
+              echo "📦 Checking repository status..."
+              if gcloud artifacts repositories describe ${{ env.REPO_NAME }} --location=${{ env.GCP_REGION }} --project=${{ env.GCP_PROJECT_ID }} --quiet >/dev/null 2>&1; then
+                echo "✅ Repository exists"
+              else
+                echo "❌ Repository does not exist!"
+                echo ""
+                echo "🛠️ Attempting to create repository now..."
+                if gcloud artifacts repositories create ${{ env.REPO_NAME }} \
+                  --repository-format=docker \
+                  --location=${{ env.GCP_REGION }} \
+                  --description="Docker repository for ${{ env.SERVICE_NAME }}" \
+                  --project=${{ env.GCP_PROJECT_ID }} \
+                  --quiet; then
+                  echo "✅ Repository created successfully!"
+                  echo "⏳ Waiting for repository to be ready..."
+                  sleep 10
+                else
+                  echo "❌ Failed to create repository"
+                  echo ""
+                  echo "📋 Manual steps required:"
+                  echo "gcloud artifacts repositories create ${{ env.REPO_NAME }} \\"
+                  echo "  --repository-format=docker \\"
+                  echo "  --location=${{ env.GCP_REGION }} \\"
+                  echo "  --project=${{ env.GCP_PROJECT_ID }}"
+                fi
+              fi
+              echo ""
+            fi
+            
+            if [ $i -lt $MAX_RETRIES ]; then
+              WAIT_TIME=$((i * 10))
+              echo "⏳ Waiting ${WAIT_TIME} seconds before retry..."
+              sleep $WAIT_TIME
+            fi
+          fi
+        done
+        
+        if [ "$PUSH_SUCCESS" = false ]; then
+          echo ""
+          echo "❌ Failed to push image after $MAX_RETRIES attempts"
+          echo "🔧 This is usually caused by:"
+          echo "1. Missing Artifact Registry repository"
+          echo "2. Insufficient IAM permissions"
+          echo "3. Disabled Artifact Registry API"
+          echo ""
+          echo "📖 See GCP-SETUP.md for detailed setup instructions"
+          exit 1
+        fi
+        
+        echo "🎉 Docker image pushed successfully!"
+
+    - name: Deploy to Cloud Run
+      if: ${{ env.DEPLOYMENT_TYPE == 'cloudrun' }}
+      run: |
+        echo "Deploying to Cloud Run..."
+        gcloud run deploy ${{ env.SERVICE_NAME }} \
+          --image ${{ env.IMAGE_URL }} \
+          --platform managed \
+          --region ${{ env.GCP_REGION }} \
+          --allow-unauthenticated \
+          --port 8080 \
+          --memory 512Mi \
+          --cpu 1 \
+          --min-instances 0 \
+          --max-instances 10
+        URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} --region ${{ env.GCP_REGION }} --format 'value(status.url)')
+        echo "## 🚀 Cloud Run Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+        echo "**Service Name:** ${{ env.SERVICE_NAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Service URL:** $URL" >> $GITHUB_STEP_SUMMARY
+        echo "**Region:** ${{ env.GCP_REGION }}" >> $GITHUB_STEP_SUMMARY
+
+    - name: Install envsubst
+      if: ${{ env.DEPLOYMENT_TYPE == 'gke' }}
+      run: sudo apt-get update && sudo apt-get install -y gettext-base
+
+    - name: Install GKE auth plugin
+      if: ${{ env.DEPLOYMENT_TYPE == 'gke' }}
+      run: |
+        echo "🔧 Installing GKE gcloud auth plugin..."
+        
+        # Install the plugin using gcloud components
+        gcloud components install gke-gcloud-auth-plugin --quiet
+        
+        echo "✅ GKE auth plugin installed"
+
+    - name: Deploy to GKE
+      if: ${{ env.DEPLOYMENT_TYPE == 'gke' }}
+      env:
+        USE_GKE_GCLOUD_AUTH_PLUGIN: True
+      run: |
+        echo "Deploying to GKE..."
+        gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} --region ${{ env.GCP_REGION }} --project ${{ env.GCP_PROJECT_ID }}
+        kubectl create namespace ${{ env.GKE_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+        export IMAGE_URL="${{ env.IMAGE_URL }}"
+        export SERVICE_NAME="${{ env.SERVICE_NAME }}"
+        envsubst < k8s/deployment.yaml | kubectl apply -f - -n ${{ env.GKE_NAMESPACE }}
+        envsubst < k8s/service.yaml | kubectl apply -f - -n ${{ env.GKE_NAMESPACE }}
+        kubectl rollout status deployment/${{ env.SERVICE_NAME }}-deployment -n ${{ env.GKE_NAMESPACE }} --timeout=300s
+        echo "## 🚀 GKE Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+        echo "**Service Name:** ${{ env.SERVICE_NAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Cluster:** ${{ env.GKE_CLUSTER }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Namespace:** ${{ env.GKE_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Region:** ${{ env.GCP_REGION }}" >> $GITHUB_STEP_SUMMARY
